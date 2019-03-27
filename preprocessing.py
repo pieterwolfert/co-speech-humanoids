@@ -1,8 +1,3 @@
-"""
-Reimplementation of the paper by Youngwoo Yoon et al.
-
-author: Pieter Wolfert
-"""
 import pickle
 import numpy as np
 import pandas as pd
@@ -12,6 +7,8 @@ from tqdm import tqdm
 import webvtt
 from datetime import datetime, timedelta
 from sklearn.decomposition import PCA
+
+__author__ = "Pieter Wolfert"
 
 class DataProcessor():
     """

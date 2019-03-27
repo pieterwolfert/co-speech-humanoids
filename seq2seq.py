@@ -15,6 +15,8 @@ from model import EncoderRNN, AttnDecoderRNN
 from dataloader import DataLoader, Dataset
 from custom_classes import CustomLoss
 
+__author__ = "Pieter Wolfert"
+
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class Seq2Pose():

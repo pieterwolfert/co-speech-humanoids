@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import numpy as np
 from torch.autograd import Variable
 
+__author__ = "Pieter Wolfert"
+
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class EncoderRNN(nn.Module):
