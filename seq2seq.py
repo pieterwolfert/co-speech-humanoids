@@ -22,20 +22,49 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 class Seq2Pose():
     def __init__(self, wm, input_length, batch_size, hidden_size, bidirectional\
             , embedding_size, n_parameter, m_parameter, learning_rate, clip,\
-                alpha, beta):
+                alpha, beta, pre_trained_file = None):
         self.batch_size = batch_size
         self.hidden_size = hidden_size
+        self.embedding_size = embedding_size
         self.bidirectional = bidirectional
         self.n_parameter = n_parameter
         self.m_parameter = m_parameter
         self.learning_rate = learning_rate
+        self.wm = wm
         self.clip = clip
         self.alpha = alpha
         self.beta = beta
-        self.encoder = EncoderRNN(wm, embedding_size, hidden_size, bidirectional)
-        self.encoder = self.encoder.to(device)
-        self.decoder = AttnDecoderRNN(hidden_size, 10)
+        if pre_trained_file == None:
+            self.encoder = EncoderRNN(self.wm, self.embedding_size,\
+                hidden_size, bidirectional)
+            self.decoder = AttnDecoderRNN(self.hidden_size, 10)
+            self.enc_optimizer = optim.Adam(self.encoder.parameters(),\
+                lr=self.learning_rate)
+            self.dec_optimizer = optim.Adam(self.decoder.parameters(),\
+                lr=self.learning_rate)
+            self.start = 0
+        else:
+            self.resume_training = True
+            self.encoder, self.decoder, self.enc_optimizer, self.dec_optimizer,\
+                self.start = self.load_model_state(pre_trained_file)
         self.decoder = self.decoder.to(device)
+        self.encoder = self.encoder.to(device)
+
+    def load_model_state(self, model_file):
+        print("Resuming training from a given model...")
+        model = torch.load(model_file, map_location=lambda storage, loc: storage)
+        epoch = model['epoch']
+        encoder_state_dict = model['encoder_state_dict']
+        encoder_optimizer_state_dict = model['encoder_optimizer_state_dict']
+        decoder_state_dict = model['decoder_state_dict']
+        decoder_optimizer_state_dict = model['decoder_optimizer_state_dict']
+        loss = model['loss']
+        encoder = EncoderRNN(self.wm, self.embedding_size,\
+            self.hidden_size, self.bidirectional)
+        decoder = AttnDecoderRNN(self.hidden_size, 10)
+        enc_optimizer = optim.Adam(encoder.parameters(), lr=self.learning_rate)
+        dec_optimizer = optim.Adam(decoder.parameters(), lr=self.learning_rate)
+        return encoder, decoder, enc_optimizer, dec_optimizer, epoch
 
     def train(self, epochs, x_train, y_train):
         """
@@ -46,29 +75,24 @@ class Seq2Pose():
         x_train - training data, contains a list of integer encoded strings
         y_train - training data, contains a list of pose sequences
         """
-        enc_optimizer = optim.Adam(self.encoder.parameters(),\
-            lr=self.learning_rate)
-        dec_optimizer = optim.Adam(self.decoder.parameters(),\
-            lr=self.learning_rate)
         criterion = CustomLoss(self.alpha, self.beta)
         training_set = Dataset(x_train, y_train)
         training_generator = data.DataLoader(training_set,\
             batch_size=self.batch_size, shuffle=True,\
             collate_fn=self.pad_and_sort_batch,\
             num_workers=8, drop_last=True)
-
         decoder_fixed_previous = Variable(torch.zeros(self.n_parameter,\
             self.batch_size, 10, requires_grad=False)).to(device)
         decoder_fixed_input = torch.FloatTensor\
             ([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]] *\
                 self.batch_size).to(device)
 
-        for epoch in range(epochs):
+        for epoch in range(self.start, epochs):
             total_loss = 0
             for mini_batches, max_target_length in tqdm(training_generator):
                 #kickstart vectors
-                enc_optimizer.zero_grad()
-                dec_optimizer.zero_grad()
+                self.enc_optimizer.zero_grad()
+                self.dec_optimizer.zero_grad()
                 loss = 0
                 decoder_previous_inputs = decoder_fixed_previous
                 for z in range(self.n_parameter):
@@ -110,12 +134,12 @@ class Seq2Pose():
                         self.clip)
                 torch.nn.utils.clip_grad_norm_(self.decoder.parameters(),\
                         self.clip)
-                enc_optimizer.step()
-                dec_optimizer.step()
+                self.enc_optimizer.step()
+                self.dec_optimizer.step()
 
             if epoch % 10 == 0:
-                self.save_model(self.encoder, self.decoder, enc_optimizer,\
-                    dec_optimizer, epoch, "./models/seq2seq_{}_{}.tar".\
+                self.save_model(self.encoder, self.decoder, self.enc_optimizer,\
+                    self.dec_optimizer, epoch, "./models/seq2seq_{}_{}.tar".\
                     format(epoch, total_loss/len(x_train)), total_loss)
             print("Epoch: {} Loss: {}".format(epoch, total_loss))
 
