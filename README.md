@@ -11,8 +11,8 @@ A PyTorch implementation of "Robots Learn Social Skills: End-to-End Learning of 
 
 You can find the dataset and more information on the paper [here](https://sites.google.com/view/youngwoo-yoon/projects/co-speech-gesture-generation).
 
-#### Update 23/5
-Although training appears to provide fluent poses, I haven't been able yet to reproduce the same results as Youngwoo. Training time is also much longer than stated in the original paper. I will update this repository once I have fixed these issues.
+#### Update 28/10
+Thank you [Eddie Wang](https://github.com/ehwa009) for updating the implementation!
 
 ----
 ### Installation
