@@ -2,82 +2,95 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from torch.autograd import Variable
-
-__author__ = "Pieter Wolfert"
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class EncoderRNN(nn.Module):
-    def __init__(self, weight_matrix, embedding_size, hidden_size, bidirectional):
+    def __init__(self, weight_matrix, input_size, hidden_size, bidirectional, n_layers=2, dropout=0.1):
         super(EncoderRNN, self).__init__()
-        self.embedding = nn.Embedding.from_pretrained(weight_matrix, freeze=True)
+        
+        self.input_size = input_size
         self.hidden_size = hidden_size
         self.bidirectional = bidirectional
-        self.gru = nn.GRU(embedding_size, hidden_size, num_layers=2, bidirectional=self.bidirectional, dropout=0.1)
-
-    def forward(self, input_t, hidden=None):
-        embedded = self.embedding(input_t)
-        outputs, hidden = self.gru(embedded, hidden)
+        self.n_layers = n_layers
+        self.dropout = dropout
+        # lookup table from pre-trained embedding matrix (globe)        
+        self.embedding = nn.Embedding.from_pretrained(weight_matrix, freeze=True)
+        self.gru = nn.GRU(hidden_size+100, hidden_size, bidirectional=self.bidirectional, num_layers=n_layers, dropout=self.dropout)
+        
+    def forward(self, input_seqs, input_lengths, hidden=None):
+        embedded = self.embedding(input_seqs)
+        packed = torch.nn.utils.rnn.pack_padded_sequence(embedded, input_lengths)
+        output, hidden = self.gru(packed, hidden)
+        output, _ = torch.nn.utils.rnn.pad_packed_sequence(output) # unpacked, backed to padded
+        # output, hidden = self.gru(embedded, hidden)
         if self.bidirectional:
-            outputs = outputs[:, :, :self.hidden_size] + outputs[:, : ,self.hidden_size:]
-        return outputs, hidden
+            output = output[:,:,:self.hidden_size] + output[:,:,self.hidden_size:]
 
-    def initHidden(self, batch_size):
-        if self.bidirectional:
-            return torch.zeros(4, batch_size, self.hidden_size, device=device)
-        return torch.zeros(2, batch_size, self.hidden_size, device=device)
+        return output, hidden         
+
 
 class Attn(nn.Module):
-    def __init__(self, hidden_size):
+    def __init__(self, method, hidden_size):
         super(Attn, self).__init__()
+        
+        self.method = method
         self.hidden_size = hidden_size
-        self.attn = nn.Linear(self.hidden_size, hidden_size)
-
+        
+        if self.method == 'general':
+            self.attn = nn.Linear(self.hidden_size, hidden_size)
+            
     def forward(self, hidden, encoder_outputs):
-        max_len = encoder_outputs.size(0)
-        this_batch_size = encoder_outputs.size(1)
-        # Create variable to store attention energies
-        attn_energies = Variable(torch.zeros(this_batch_size, max_len)).to(device) # B x 1 x S
-        # Calculate energies for each batch of encoder outputs
-        for b in range(this_batch_size):
-            # Calculate energy for each encoder output
-            for i in range(max_len):
-                attn_energies[b, i] = self.score(hidden[:, b].squeeze(0), encoder_outputs[i, b].unsqueeze(0))
-        # Normalize energies to weights in range 0 to 1, resize to 1 x B x S
-        return F.softmax(attn_energies).unsqueeze(1)
-
+        seq_len = encoder_outputs.size(0)
+        batch_size = encoder_outputs.size(1)
+        
+        # variable to store attention energies
+        attn_energies = torch.zeros(batch_size, seq_len).to(device)
+        
+        # for each batch of encoder outputs
+        for b in range(batch_size):
+            # caculate energy for each encoder output
+            for i in range(seq_len):
+                attn_energies[b, i] = self.score(hidden[:,b].squeeze(0), encoder_outputs[i,b].unsqueeze(0))
+                
+        return F.softmax(attn_energies, dim=1).unsqueeze(1)
+       
     def score(self, hidden, encoder_output):
-        energy = self.attn(encoder_output)
-        energy = hidden.dot(energy.squeeze(0))
-        return energy
+        if self.method == 'general':
+            energy = self.attn(encoder_output)
+            energy = energy.squeeze(0)
+            energy = hidden.dot(energy)
+            return energy
+
 
 class AttnDecoderRNN(nn.Module):
-    def __init__(self, hidden_size, output_size,  n_layers=2, dropout_p=0.1):
+    def __init__(self, attn_model, hidden_size, output_size, n_layers=2, dropout=0.1):
         super(AttnDecoderRNN, self).__init__()
-
-        # Define parameters
+        
+        self.attn_model = attn_model
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.n_layers = n_layers
-        self.dropout_p = dropout_p
-
-        # Define layers
-        self.dropout = nn.Dropout(dropout_p)
-        self.attn = Attn(hidden_size).to(device)
+        self.dropout = dropout
+        
+        self.attn = Attn(attn_model, hidden_size)
         self.pre_linear = nn.Linear(hidden_size + 10, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size, n_layers, dropout=dropout_p)
+        self.gru = nn.GRU(hidden_size, hidden_size, n_layers, dropout=dropout)
         self.post_linear = nn.Linear(hidden_size, output_size)
-
+        
     def forward(self, motion_input, last_hidden, encoder_outputs):
-        """
-        """
+        batch_size = motion_input.size(0)
+        
+        # calculate attention
         attn_weights = self.attn(last_hidden[-1].unsqueeze(0), encoder_outputs)
-        context = attn_weights.bmm(encoder_outputs.transpose(0, 1)) # B x 1 x N
-
-        rnn_input = torch.cat((motion_input.unsqueeze(1), context), 2).to(device)
+        context = attn_weights.bmm(encoder_outputs.transpose(0,1))
+        # concatenate context vector with last decoder hidden
+        rnn_input = torch.cat((motion_input.unsqueeze(1), context), 2)
+        
+        # now we forward to rest of layers
         rnn_input = self.pre_linear(rnn_input)
-        output, hidden = self.gru(rnn_input.transpose(0, 1), last_hidden)
+        output, hidden = self.gru(rnn_input.transpose(0,1), last_hidden)
         output = self.post_linear(output)
-        output = output.squeeze(0) # B x N
+        output = output.squeeze(0)
+        
         return output, hidden, attn_weights

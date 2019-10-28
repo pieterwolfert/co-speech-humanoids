@@ -1,28 +1,29 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from torch import optim
+from torch.utils import data
+
 import pickle
 import numpy as np
 import random
 import time
 
-from torch import optim
-from torch.utils import data
-from torch.autograd import Variable
 from tqdm import tqdm
-
 from model import EncoderRNN, AttnDecoderRNN
 from dataloader import DataLoader, Dataset
 from custom_classes import CustomLoss
 
-__author__ = "Pieter Wolfert"
+import matplotlib.pyplot as plt
+import sys
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class Seq2Pose():
-    def __init__(self, wm, input_length, batch_size, hidden_size, bidirectional\
-            , embedding_size, n_parameter, m_parameter, learning_rate, clip,\
-                alpha, beta, pre_trained_file = None):
+    def __init__(self, wm, input_length, batch_size, hidden_size, bidirectional, 
+                    embedding_size, n_parameter, m_parameter, learning_rate, clip, 
+                    alpha, beta, pre_trained_file = None, teacher_forcing_ratio=0.7):
         self.batch_size = batch_size
         self.hidden_size = hidden_size
         self.embedding_size = embedding_size
@@ -34,21 +35,24 @@ class Seq2Pose():
         self.clip = clip
         self.alpha = alpha
         self.beta = beta
+        self.loss_list = []
+        self.teacher_forcing_ratio = teacher_forcing_ratio
+        
         if pre_trained_file == None:
-            self.encoder = EncoderRNN(self.wm, self.embedding_size,\
-                hidden_size, bidirectional)
-            self.decoder = AttnDecoderRNN(self.hidden_size, 10)
-            self.enc_optimizer = optim.Adam(self.encoder.parameters(),\
-                lr=self.learning_rate)
-            self.dec_optimizer = optim.Adam(self.decoder.parameters(),\
-                lr=self.learning_rate)
-            self.start = 0
+            # define encoder and decoder
+            self.encoder = EncoderRNN(self.wm, self.embedding_size, hidden_size, bidirectional)
+            self.decoder = AttnDecoderRNN("general", self.hidden_size, 10)
+            # define optimizer of encoder and decoder
+            self.enc_optimizer = optim.Adam(self.encoder.parameters(), lr=self.learning_rate)
+            self.dec_optimizer = optim.Adam(self.decoder.parameters(), lr=self.learning_rate)
+            self.start = 1
         else:
             self.resume_training = True
             self.encoder, self.decoder, self.enc_optimizer, self.dec_optimizer,\
-                self.start = self.load_model_state(pre_trained_file)
+                self.start = self.load_model_state(pre_trained_file)      
         self.decoder = self.decoder.to(device)
         self.encoder = self.encoder.to(device)
+
 
     def load_model_state(self, model_file):
         print("Resuming training from a given model...")
@@ -61,157 +65,153 @@ class Seq2Pose():
         loss = model['loss']
         encoder = EncoderRNN(self.wm, self.embedding_size,\
             self.hidden_size, self.bidirectional)
-        decoder = AttnDecoderRNN(self.hidden_size, 10)
+        decoder = AttnDecoderRNN("general", self.hidden_size, 10)
         enc_optimizer = optim.Adam(encoder.parameters(), lr=self.learning_rate)
         dec_optimizer = optim.Adam(decoder.parameters(), lr=self.learning_rate)
+        
         return encoder, decoder, enc_optimizer, dec_optimizer, epoch
+    
+     
+    def train(self, input_batch, target_batch, input_length, target_lengths, criterion):
+        # make zero gradient
+        self.enc_optimizer.zero_grad()
+        self.dec_optimizer.zero_grad()
+        
+        # fowarding encoder with embedded inputs
+        encoder_outputs, encoder_hidden = self.encoder(input_batch, input_length, None)
+        decoder_hidden = encoder_hidden[:self.decoder.n_layers]
+        
+        # variable to store decoder output
+        all_decoder_outputs = torch.zeros(target_batch.size(0), target_batch.size(1), target_batch.size(2)).to(device)
+        # set initial pose from the selected dataset
+        decoder_input = target_batch[0].float()
+        all_decoder_outputs[0] = decoder_input
+        
+        # forwarding decoder with teacher forcing
+        # use_teacher_forcing = True if random.random() < self.teacher_forcing_ratio else False # set teacher forcing ratio
+        use_teacher_forcing = True
+        if use_teacher_forcing:
+            for di in range(1, target_lengths):
+                decoder_output, decoder_hidden, decoder_attention = self.decoder(decoder_input, decoder_hidden, encoder_outputs)
+                all_decoder_outputs[di] = decoder_output
+                decoder_input = target_batch[di].float()
+        else:
+            for di in range(1, target_lengths):
+                decoder_output, decoder_hidden, decoder_attention = self.decoder(decoder_input, decoder_hidden, encoder_outputs)
+                all_decoder_outputs[di] = decoder_output
+                decoder_input = decoder_output.float()
+        
+        # to calculate continuity of poses, set previous pose (t-1)
+        # here we only use 20 poses to calculate loss
+        # rest of 10 poses will be used during inferencing
+        successive_gesture_generated = all_decoder_outputs[:20]
+        decoder_previous_generated = torch.zeros(successive_gesture_generated.size(0),
+                                                successive_gesture_generated.size(1),
+                                                successive_gesture_generated.size(2)).to(device)
+        decoder_previous_generated[1:] = successive_gesture_generated[:-1]
+        
+        # claculate loss
+        loss = criterion(successive_gesture_generated.float(), decoder_previous_generated.float(), target_batch[:20].float())
+        loss.backward()
+        
+        # clip the gradient
+        torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.clip)
+        torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), self.clip)
+        # update weigt after one minibatch
+        self.enc_optimizer.step()
+        self.dec_optimizer.step()
+        
+        return loss.item()
 
-    def train(self, epochs, x_train, y_train):
-        """
-        Training loop, trains the network for the given parameters.
-
-        Keyword arguments:
-        epochs - number of epochs to train for (looping over the whole dataset)
-        x_train - training data, contains a list of integer encoded strings
-        y_train - training data, contains a list of pose sequences
-        """
+    def trainIter(self, x_train, y_train, epochs, num_workers=6):
         criterion = CustomLoss(self.alpha, self.beta)
         training_set = Dataset(x_train, y_train)
-        training_generator = data.DataLoader(training_set,\
-            batch_size=self.batch_size, shuffle=True,\
-            collate_fn=self.pad_and_sort_batch,\
-            num_workers=8, drop_last=True)
-        decoder_fixed_previous = Variable(torch.zeros(self.n_parameter,\
-            self.batch_size, 10, requires_grad=False)).to(device)
-        decoder_fixed_input = torch.FloatTensor\
-            ([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]] *\
-                self.batch_size).to(device)
+        training_generator = data.DataLoader(training_set,
+                    batch_size=self.batch_size, shuffle=True,
+                    collate_fn=self.pad_and_sort_batch,
+                    drop_last=True, num_workers=num_workers)
+        
+        for epoch in range(self.start, epochs+1):
+            loss = 0
+            for mini_batches in tqdm(training_generator):
+                for i, (input_tensor, input_length, output_tensor, output_length) in enumerate(mini_batches):
+                    # allocate tensors to GPU
+                    input_tensor = input_tensor.to(device)
+                    output_tensor = output_tensor.to(device)
+                    loss += self.train(input_tensor, output_tensor,
+                                        input_length, output_length, criterion)
+            print("epoch {} average minibatch loss: {:.6f}".format(epoch, loss/len(training_generator)))
 
-        for epoch in range(self.start, epochs):
-            total_loss = 0
-            for mini_batches, max_target_length in tqdm(training_generator):
-                #kickstart vectors
-                self.enc_optimizer.zero_grad()
-                self.dec_optimizer.zero_grad()
-                loss = 0
-                decoder_previous_inputs = decoder_fixed_previous
-                for z in range(self.n_parameter):
-                    decoder_previous_inputs[z] = decoder_fixed_input
-                for i, (x, y, lengths) in enumerate(mini_batches):
-                    t1 = time.perf_counter()
-                    x = x.to(device)
-                    y = y.to(device)
-                    decoder_m = np.shape(y)[0]
-                    encoder_outputs, encoder_hidden = self.encoder(x, None)
-                    decoder_hidden = encoder_hidden[:self.decoder.n_layers]
-                    decoder_output = None
-                    for n_prev in range(self.n_parameter):
-                        decoder_output, decoder_hidden, attn_weights =\
-                            self.decoder(decoder_previous_inputs[n_prev].float(),\
-                                decoder_hidden, encoder_outputs)
-                    decoder_input = decoder_output.float()
-                    decoder_previous_generated = Variable(torch.zeros(decoder_m,\
-                        self.batch_size, 10, requires_grad=False)).to(device)
-                    decoder_outputs_generated = Variable(torch.zeros(decoder_m,\
-                        self.batch_size, 10, requires_grad=False)).to(device)
-                    for fut_pose in range(decoder_m):
-                        decoder_output, decoder_hidden, attn_weights =\
-                            self.decoder(decoder_input,decoder_hidden, encoder_outputs)
-                        decoder_outputs_generated[fut_pose] = decoder_output
-                        decoder_input = y[fut_pose].float()
-                    decoder_previous_inputs = decoder_outputs_generated[:-10]
-                    # max_length, batch_, item
-                    # now mask generated outputs
-                    decoder_masked = torch.where(y == 0.0, y.float(),\
-                        decoder_outputs_generated.float())
-                    decoder_previous_generated[1:] = decoder_masked[:-1]
-                    loss += criterion(decoder_masked, decoder_previous_generated,\
-                        y.float())
-                    total_loss += loss.item()
-
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.encoder.parameters(),\
-                        self.clip)
-                torch.nn.utils.clip_grad_norm_(self.decoder.parameters(),\
-                        self.clip)
-                self.enc_optimizer.step()
-                self.dec_optimizer.step()
-
+            # save model
             if epoch % 10 == 0:
                 self.save_model(self.encoder, self.decoder, self.enc_optimizer,\
-                    self.dec_optimizer, epoch, "./models/seq2seq_{}_{}.tar".\
-                    format(epoch, total_loss/len(x_train)), total_loss)
-            print("Epoch: {} Loss: {}".format(epoch, total_loss))
-
-
+                self.dec_optimizer, epoch, "./models/seq2seq_{}_{}.tar".\
+                                    format(epoch, loss), loss/len(training_generator))
+                print("trained model saved.")
+            self.loss_list.append(loss)
+            self.loss_graph(self.loss_list) #save loss 
+    
     def pad_and_sort_batch(self, DataLoaderBatch):
-        """
-        Pads and sorts the batches, provided as a collate function.
-
-        Keyword arguments:
-        DataLoaderBatch - Batch of data coming from dataloader class.
-        """
         batch_size = len(DataLoaderBatch)
-        batch_split = list(zip(*DataLoaderBatch))
-
-        seqs, targs, lengths, target_lengths = batch_split[0], batch_split[1],\
-            batch_split[2], batch_split[3]
-
-        #calculating the size for the minibatches
-        max_length = max(lengths) #longest sequence in X
+        
+        # sort by length (descending)
+        seq_pairs = sorted(DataLoaderBatch, key=lambda p: len(p[0]), reverse=True)
+        batch_split = list(zip(*seq_pairs))
+        input_seqs, target_seqs, input_lengths, target_lengths = batch_split[0], batch_split[1], batch_split[2], batch_split[3]   
+        
+        max_input_length = max(input_lengths) #longest sequence in X
         max_target_length = max(target_lengths) #longest sequence in Y
-        number_of_chunks = int(max_target_length / self.m_parameter)
-        not_in_chunk = max_target_length % self.m_parameter
-        words_per_chunk = int(max_length / number_of_chunks)
-        not_in_words_per_chunk = max_length % words_per_chunk
 
-        #first zeropad it all
-        padded_seqs = np.zeros((batch_size, max_length))
-        for i, l in enumerate(lengths):
-            padded_seqs[i, 0:l] = seqs[i][0:l]
-        new_targets = np.zeros((batch_size, max([len(s) for s in targs]), 10))
-        for i, item in enumerate(targs):
-            new_targets[i][:len(targs[i])] = targs[i]
-        seq_lengths, perm_idx = torch.tensor(lengths).sort(descending=True)
-        seq_lengths = list(seq_lengths)
-        seq_tensor = padded_seqs[perm_idx]
-        target_tensor = new_targets[perm_idx]
-        #Full batch is sorted, now we are going to create minibatches.
-        #in these batches time comes first, so: [time, batch, features]
-        #we also add a vector with lengths, which are necessary for padding
+        # zeropaded to input_seqs
+        input_padded = np.zeros((batch_size, max_input_length))
+        for i, l in enumerate(input_lengths):
+            input_padded[i, 0:l] = input_seqs[i][0:l]
+        # zeropaded to target_seqs
+        target_padded = np.zeros((batch_size, max([len(s) for s in target_seqs]), 10))
+        for t, item in enumerate(target_seqs):
+            target_padded[t][:len(target_seqs[t])] = target_seqs[t]
+
+        # make mini batches
         mini_batches = [] #contains x and y tensor per item
-        seq_tensor = np.transpose(seq_tensor, (1,0))
-        target_tensor = np.transpose(target_tensor, (1,0,2))
-        counter = 0
-        for i in range(number_of_chunks):
-            x = seq_tensor[i*words_per_chunk:(i+1)*words_per_chunk]
-            y = target_tensor[i*self.m_parameter:(i+1)*self.m_parameter]
-            counter += words_per_chunk*i
-            x_mini_batch_lengths = []
-            for j in range(batch_size):
-                if seq_lengths[j] > counter and seq_lengths[j] < counter + words_per_chunk:
-                    x_mini_batch_lengths.append(seq_lengths[j].item() - counter)
-                elif seq_lengths[j] > counter + words_per_chunk:
-                    x_mini_batch_lengths.append(words_per_chunk)
+        divide = self.m_parameter + self.n_parameter
+        #calculating the size for the minibatches
+        number_of_chunks = int(max_target_length / (divide))
+        
+        window_size, overlapped = self.get_sliding_window(number_of_chunks, input_padded.shape[1])
+        for nc in range(number_of_chunks):
+            # variable to save input length of x
+            x_lengths = []
+            if nc == 0:
+                x = input_padded[:,:window_size]
+            else:
+                x = input_padded[:,nc*window_size-nc*overlapped:(nc+1)*window_size-nc*overlapped]
+            y = target_padded[:, nc*divide:(nc+1)*divide, :]
+            # count nonzero and add length of each sequence
+            # if there is no length, add 1 (implemented based on https://github.com/pytorch/pytorch/issues/4582)
+            for b in range(batch_size):
+                length = np.count_nonzero(x[b])
+                if length > 0:
+                    x_lengths.append(length)
                 else:
-                    x_mini_batch_lengths.append(0)
-            mini_batches.append([torch.tensor(x).long(), torch.tensor(y), x_mini_batch_lengths])
-        if not_in_chunk != 0:
-            x = seq_tensor[number_of_chunks*words_per_chunk:]
-            y = target_tensor[number_of_chunks*self.m_parameter:]
-            x_mini_batch_lengths = []
-            counter = number_of_chunks * words_per_chunk
-            for j in range(batch_size):
-                if seq_lengths[j] > counter and seq_lengths[j] < counter + words_per_chunk:
-                    x_mini_batch_lengths.append(seq_lengths[j].item() - counter)
-                elif seq_lengths[j] > counter + words_per_chunk:
-                    x_mini_batch_lengths.append(words_per_chunk)
-                else:
-                    x_mini_batch_lengths.append(0)
-            if len(x) > 0 and len(y) > 0:
-                mini_batches.append([torch.tensor(x).long(), torch.tensor(y), x_mini_batch_lengths])
-        return mini_batches, max_target_length
+                    x_lengths.append(1)
 
+            # transpose and make x_train and y_train into torch tensor
+            x = np.transpose(x, (1,0))
+            input_var = torch.LongTensor(x)
+            y = np.transpose(y, (1,0,2))
+            target_var = torch.LongTensor(y)
+            input_lengths = x_lengths
+
+            mini_batches.append([input_var, input_lengths, target_var, len(y)])
+        
+        return mini_batches
+
+    def get_sliding_window(self, num_chunk, word_seq_length):
+        overlapped_size_alpha = num_chunk - 1
+        constant_beta = 4 # we assume that there is 3 overlapped words
+        window_size = int((word_seq_length + overlapped_size_alpha*constant_beta) / num_chunk)
+        
+        return window_size, constant_beta
 
     def save_model(self, encoder, decoder, enc_optimizer, dec_optimizer,\
         epoch, PATH, loss):
@@ -223,3 +223,9 @@ class Seq2Pose():
             'decoder_optimizer_state_dict': dec_optimizer.state_dict(),
             'loss': loss,
             }, PATH)
+
+    def loss_graph(self, loss_list, title="loss"):
+        plt.plot(loss_list, '-r', label='loss')
+        plt.xlabel("epoch")
+        plt.title(title)
+        plt.savefig("./loss_fig/loss.png")
