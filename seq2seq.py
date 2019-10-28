@@ -11,7 +11,7 @@ import random
 import time
 
 from tqdm import tqdm
-from model import EncoderRNN, AttnDecoderRNN
+from model import EncoderRNN, AttnDecoderRNN, BahdanauAttnDecoderRNN
 from dataloader import DataLoader, Dataset
 from custom_classes import CustomLoss
 
@@ -23,7 +23,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 class Seq2Pose():
     def __init__(self, wm, input_length, batch_size, hidden_size, bidirectional, 
                     embedding_size, n_parameter, m_parameter, learning_rate, clip, 
-                    alpha, beta, pre_trained_file = None, teacher_forcing_ratio=0.7):
+                    alpha, beta, pre_trained_file = None, decoder_type="original", teacher_forcing_ratio=0.7):
         self.batch_size = batch_size
         self.hidden_size = hidden_size
         self.embedding_size = embedding_size
@@ -37,11 +37,18 @@ class Seq2Pose():
         self.beta = beta
         self.loss_list = []
         self.teacher_forcing_ratio = teacher_forcing_ratio
+        self.decoder_type = decoder_type
         
         if pre_trained_file == None:
             # define encoder and decoder
-            self.encoder = EncoderRNN(self.wm, self.embedding_size, hidden_size, bidirectional)
-            self.decoder = AttnDecoderRNN("general", self.hidden_size, 10)
+            self.encoder = EncoderRNN(self.wm, self.embedding_size, hidden_size, bidirectional, n_layers=1)
+            
+            # select decoder type
+            if self.decoder_type == "original":
+                self.decoder = AttnDecoderRNN("general", self.hidden_size, 10)
+            elif self.decoder_type == "bahdanau":
+                self.decoder = BahdanauAttnDecoderRNN(self.embedding_size, hidden_size, 10, discrete_representation=True)
+            
             # define optimizer of encoder and decoder
             self.enc_optimizer = optim.Adam(self.encoder.parameters(), lr=self.learning_rate)
             self.dec_optimizer = optim.Adam(self.decoder.parameters(), lr=self.learning_rate)
@@ -178,6 +185,8 @@ class Seq2Pose():
         number_of_chunks = int(max_target_length / (divide))
         
         window_size, overlapped = self.get_sliding_window(number_of_chunks, input_padded.shape[1])
+        # window_size = 6
+        # overlapped = 3
         for nc in range(number_of_chunks):
             # variable to save input length of x
             x_lengths = []
@@ -195,23 +204,31 @@ class Seq2Pose():
                 else:
                     x_lengths.append(1)
 
+
             # transpose and make x_train and y_train into torch tensor
             x = np.transpose(x, (1,0))
             input_var = torch.LongTensor(x)
             y = np.transpose(y, (1,0,2))
             target_var = torch.LongTensor(y)
             input_lengths = x_lengths
-
-            mini_batches.append([input_var, input_lengths, target_var, len(y)])
+            # add it to mini batche if only sequence length is eqaul to window size
+            if len(input_var) == window_size:
+                mini_batches.append([input_var, input_lengths, target_var, len(y)])
         
         return mini_batches
 
-    def get_sliding_window(self, num_chunk, word_seq_length):
-        overlapped_size_alpha = num_chunk - 1
-        constant_beta = 4 # we assume that there is 3 overlapped words
-        window_size = int((word_seq_length + overlapped_size_alpha*constant_beta) / num_chunk)
+    # def get_sliding_window(self, num_chunk, word_seq_length):
+    #     overlapped_size_alpha = num_chunk - 1
+    #     constant_beta = 4 # we assume that there is 3 overlapped words
+    #     window_size = int((word_seq_length + overlapped_size_alpha*constant_beta) / num_chunk)
         
-        return window_size, constant_beta
+    #     return window_size, constant_beta
+
+    def get_sliding_window(self, num_chunk, word_seq_length):
+        window_size = 7
+        overlapped_words = int((num_chunk*window_size - word_seq_length) / (num_chunk-1))
+
+        return window_size, overlapped_words
 
     def save_model(self, encoder, decoder, enc_optimizer, dec_optimizer,\
         epoch, PATH, loss):
