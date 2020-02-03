@@ -14,6 +14,9 @@ You can find the dataset and more information on the paper [here](https://sites.
 #### Update 28/10
 Thank you [Eddie Wang](https://github.com/ehwa009) for updating the implementation!
 
+#### Update 03/02/2020
+Have a look at [this](https://github.com/ehwa009/Co-Speech_Gesture_Generation) repository for an up to date implementation. 
+
 ----
 ### Installation
 The code is implemented in Python 3.7 and PyTorch 1.0
